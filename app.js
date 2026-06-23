@@ -13,6 +13,18 @@ let isDrawing = false;
 let lastX = 0;
 let lastY = 0;
 
+// Zoom and Pan variables
+let scale = 1.0;
+let translateX = 0;
+let translateY = 0;
+let initialPinchDistance = null;
+let lastScale = 1.0;
+let lastTranslateX = 0;
+let lastTranslateY = 0;
+let isPanning = false;
+let startX = 0;
+let startY = 0;
+
 // PDF 파일 경로 (실제 배포 시 pdf/your-file.pdf 경로에 파일을 두어야 함)
 const PDF_URL = 'assets/lecture.pdf';
 
@@ -21,18 +33,44 @@ async function initViewer() {
         const loadingTask = pdfjsLib.getDocument(PDF_URL);
         pdfDoc = await loadingTask.promise;
         
-        for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
-            await renderPage(pageNum);
-        }
+        // 초기 렌더링 시 화면에 맞게 스케일 조정
+        await renderAllPages();
+        applyTransform();
+
+        // 화면 크기 변경 (회전 포함) 감지
+        window.addEventListener('resize', debounce(renderAllPages, 200));
+
     } catch (error) {
         console.error('PDF 로드 에러:', error);
         viewerContainer.innerHTML = '<div style="color:white; padding:20px;">PDF 파일을 찾을 수 없습니다. assets 폴더에 lecture.pdf 파일을 넣어주세요.</div>';
     }
 }
 
-async function renderPage(pageNum) {
+async function renderAllPages() {
+    viewerContainer.innerHTML = ''; // 기존 페이지 제거
+    scale = 1.0; // 스케일 초기화
+    translateX = 0;
+    translateY = 0;
+    applyTransform();
+
+    if (!pdfDoc) return;
+
+    const firstPage = await pdfDoc.getPage(1);
+    const viewport = firstPage.getViewport({ scale: 1 });
+    const containerWidth = viewerContainer.clientWidth;
+    
+    // 화면 너비에 맞게 초기 스케일 계산
+    scale = containerWidth / viewport.width;
+    lastScale = scale;
+
+    for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
+        await renderPage(pageNum, scale);
+    }
+}
+
+async function renderPage(pageNum, currentScale) {
     const page = await pdfDoc.getPage(pageNum);
-    const viewport = page.getViewport({ scale: 1.5 });
+    const viewport = page.getViewport({ scale: currentScale });
 
     const pageDiv = document.createElement('div');
     pageDiv.className = 'page-container';
@@ -71,6 +109,7 @@ function setupDrawing(canvas) {
     function getPos(e) {
         const rect = canvas.getBoundingClientRect();
         const touch = e.touches ? e.touches[0] : e;
+        // 현재 줌 상태를 고려하여 좌표 계산
         return {
             x: (touch.clientX - rect.left) * (canvas.width / rect.width),
             y: (touch.clientY - rect.top) * (canvas.height / rect.height)
@@ -131,12 +170,14 @@ function setActiveTool(tool) {
     if (tool === 'pan') {
         btnPan.classList.add('active');
         document.querySelectorAll('.drawing-canvas').forEach(c => c.style.pointerEvents = 'none');
-        viewerContainer.style.overflow = 'auto';
+        // Pan 모드에서는 뷰어 컨테이너의 오버플로우를 auto로 설정하여 스크롤 가능하게 함
+        viewerContainer.style.overflow = 'auto'; 
     } else {
         if (tool === 'brush') btnBrush.classList.add('active');
         if (tool === 'eraser') btnEraser.classList.add('active');
         document.querySelectorAll('.drawing-canvas').forEach(c => c.style.pointerEvents = 'auto');
-        viewerContainer.style.overflow = 'hidden'; // 그리기 중 스크롤 방지
+        // 그리기 모드에서는 뷰어 컨테이너의 오버플로우를 hidden으로 설정하여 스크롤 방지
+        viewerContainer.style.overflow = 'hidden'; 
     }
 }
 
@@ -160,5 +201,66 @@ window.addEventListener('keydown', (e) => {
     }
 });
 
+// 핀치 줌 및 패닝 로직
+viewerContainer.addEventListener('touchstart', (e) => {
+    if (currentTool !== 'pan') return;
+    if (e.touches.length === 2) { // 두 손가락 핀치 줌
+        initialPinchDistance = getPinchDistance(e);
+        lastScale = scale;
+        isPanning = false;
+    } else if (e.touches.length === 1) { // 한 손가락 패닝
+        isPanning = true;
+        startX = e.touches[0].clientX - translateX;
+        startY = e.touches[0].clientY - translateY;
+    }
+}, { passive: false });
+
+viewerContainer.addEventListener('touchmove', (e) => {
+    if (currentTool !== 'pan') return;
+    e.preventDefault(); // 기본 스크롤/줌 동작 방지
+
+    if (e.touches.length === 2) { // 핀치 줌
+        if (initialPinchDistance === null) return;
+        const currentPinchDistance = getPinchDistance(e);
+        scale = lastScale * (currentPinchDistance / initialPinchDistance);
+        scale = Math.max(0.5, Math.min(scale, 5.0)); // 최소 0.5배, 최대 5배 줌 제한
+        applyTransform();
+    } else if (e.touches.length === 1 && isPanning) { // 패닝
+        translateX = e.touches[0].clientX - startX;
+        translateY = e.touches[0].clientY - startY;
+        applyTransform();
+    }
+}, { passive: false });
+
+viewerContainer.addEventListener('touchend', () => {
+    initialPinchDistance = null;
+    isPanning = false;
+    lastScale = scale;
+    lastTranslateX = translateX;
+    lastTranslateY = translateY;
+});
+
+function getPinchDistance(e) {
+    const dx = e.touches[0].clientX - e.touches[1].clientX;
+    const dy = e.touches[0].clientY - e.touches[1].clientY;
+    return Math.sqrt(dx * dx + dy * dy);
+}
+
+function applyTransform() {
+    viewerContainer.style.transform = `scale(${scale}) translate(${translateX / scale}px, ${translateY / scale}px)`;
+    viewerContainer.style.transformOrigin = '0 0';
+}
+
+// 디바운스 함수 (리사이즈 이벤트 과도한 호출 방지)
+function debounce(func, delay) {
+    let timeout;
+    return function(...args) {
+        const context = this;
+        clearTimeout(timeout);
+        timeout = setTimeout(() => func.apply(context, args), delay);
+    };
+}
+
 // 초기화 실행
 initViewer();
+setActiveTool('pan'); // 초기 도구는 이동/확대
